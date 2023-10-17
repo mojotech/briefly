@@ -16,7 +16,8 @@ defmodule Briefly do
   @type create_opts :: [
           {:prefix, binary},
           {:extname, binary},
-          {:directory, boolean}
+          {:directory, boolean},
+          {:secure, boolean}
         ]
 
   @doc """
@@ -24,6 +25,7 @@ defmodule Briefly do
   """
   @spec create(create_opts) ::
           {:ok, binary}
+          | {:ok, binary, pid}
           | {:no_space, binary}
           | {:too_many_attempts, binary, pos_integer}
           | {:no_tmp, [binary]}

@@ -3,6 +3,7 @@ defmodule Briefly.Entry do
 
   @dir_table __MODULE__.Dir
   @path_table __MODULE__.Path
+  @pid_table __MODULE__.Pid
   @max_attempts 10
 
   def server do
@@ -21,9 +22,14 @@ defmodule Briefly.Entry do
   def create(%{monitor_pid: pid} = options) do
     IO.warn("the :monitor_pid option is deprecated, please use Briefly.give_away/3 instead.")
 
-    with {:ok, path} <- create(Map.delete(options, :monitor_pid)) do
-      :ok = give_away(path, pid, self())
-      {:ok, path}
+    case create(Map.delete(options, :monitor_pid)) do
+      {:ok, path} ->
+        :ok = give_away(path, pid, self())
+        {:ok, path}
+
+      {:ok, path, io_pid} ->
+        :ok = give_away(path, pid, self())
+        {:ok, path, io_pid}
     end
   end
 
@@ -40,13 +46,13 @@ defmodule Briefly.Entry do
   @doc false
   def cleanup(pid) do
     case :ets.lookup(@dir_table, pid) do
-      [{pid, _tmp}] ->
+      [{^pid, _tmp}] ->
+        path_entries = :ets.lookup(@path_table, pid)
+
+        Enum.each(path_entries, &delete_path(&1))
+
         :ets.delete(@dir_table, pid)
-
-        entries = :ets.lookup(@path_table, pid)
-        Enum.each(entries, &delete_path/1)
-
-        for {_path, path} <- entries, do: path
+        for {_pid, path} <- path_entries, do: path
 
       [] ->
         []
@@ -70,6 +76,7 @@ defmodule Briefly.Entry do
 
           {:ok, tmps} = GenServer.call(server, :roots)
           {:ok, tmp} = generate_tmp_dir(tmps)
+
           :ok = GenServer.call(server, {:give_away, to_pid, tmp, path})
 
           :ets.delete_object(@path_table, {from_pid, path})
@@ -172,6 +179,25 @@ defmodule Briefly.Entry do
       :ok ->
         :ets.insert(@path_table, {self(), path})
         {:ok, path}
+
+      {:error, :enospc} ->
+        {:no_space, path}
+
+      {:error, reason} when reason in [:eexist, :eacces] ->
+        open(options, tmp, attempts + 1)
+
+      error ->
+        error
+    end
+  end
+
+  defp open(%{secure: true} = options, tmp, attempts) when attempts < @max_attempts do
+    path = path(options, tmp)
+
+    case File.open(path, [:read, :write, :exclusive]) do
+      {:ok, device_pid} ->
+        :ets.insert(@path_table, {self(), path})
+        {:ok, path, device_pid}
 
       {:error, :enospc} ->
         {:no_space, path}
