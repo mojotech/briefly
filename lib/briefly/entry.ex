@@ -3,7 +3,6 @@ defmodule Briefly.Entry do
 
   @dir_table __MODULE__.Dir
   @path_table __MODULE__.Path
-  @pid_table __MODULE__.Pid
   @max_attempts 10
 
   def server do
@@ -46,11 +45,30 @@ defmodule Briefly.Entry do
   @doc false
   def cleanup(pid) do
     case :ets.lookup(@dir_table, pid) do
-      [{^pid, _tmp}] ->
+      [{^pid, tmp}] ->
         path_entries = :ets.lookup(@path_table, pid)
 
-        Enum.each(path_entries, &delete_path(&1))
+        secondaries =
+          @path_table
+          |> :ets.lookup(pid)
+          |> Enum.reduce(MapSet.new(), fn path_entry = {_pid, path_value}, seen ->
+            delete_path(path_entry)
+            if path_value.original_owner != pid do
+              MapSet.put(seen, %{path_value | path: nil})
+            else
+              seen
+            end
+          end)
 
+        File.rmdir(tmp)
+
+        Enum.each(secondaries, fn %{original_owner: owner_pid, root_dir: dir} ->
+          if !pid_registered?(owner_pid) do
+            File.rmdir(dir)
+          end
+        end)
+
+        :ets.delete(@path_table, pid)
         :ets.delete(@dir_table, pid)
         for {_pid, path} <- path_entries, do: path
 
@@ -63,10 +81,10 @@ defmodule Briefly.Entry do
   def give_away(path, to_pid, from_pid)
       when is_binary(path) and is_pid(to_pid) and is_pid(from_pid) do
     with true <- pid_registered?(from_pid),
-         true <- path_owner?(from_pid, path) do
+         path_entry when not is_nil(path_entry) <- path_entry_if_owner(from_pid, path) do
       if pid_registered?(to_pid) do
-        :ets.insert(@path_table, {to_pid, path})
-        :ets.delete_object(@path_table, {from_pid, path})
+        :ets.insert(@path_table, {to_pid, path_entry})
+        :ets.delete_object(@path_table, {from_pid, path_entry})
         :ok
       else
         server = server()
@@ -74,8 +92,8 @@ defmodule Briefly.Entry do
         {:ok, tmps} = GenServer.call(server, :roots)
         {:ok, tmp} = generate_tmp_dir(tmps)
 
-        :ok = GenServer.call(server, {:give_away, to_pid, tmp, path})
-        :ets.delete_object(@path_table, {from_pid, path})
+        :ok = GenServer.call(server, {:give_away, to_pid, tmp, path_entry})
+        :ets.delete_object(@path_table, {from_pid, path_entry})
         :ok
       end
     else
@@ -105,12 +123,12 @@ defmodule Briefly.Entry do
     {:reply, {:ok, dirs}, dirs}
   end
 
-  def handle_call({:give_away, pid, tmp, path}, _from, dirs) do
+  def handle_call({:give_away, pid, tmp, path_entry}, _from, dirs) do
     # Since we are writing on behalf of another process, we need to make sure
     # the monitor and writing to the tables happen within the same operation.
     Process.monitor(pid)
     :ets.insert_new(@dir_table, {pid, tmp})
-    :ets.insert(@path_table, {pid, path})
+    :ets.insert(@path_table, {pid, path_entry})
 
     {:reply, :ok, dirs}
   end
@@ -127,6 +145,17 @@ defmodule Briefly.Entry do
   def terminate(_reason, _state) do
     folder = fn entry, :ok -> delete_path(entry) end
     :ets.foldl(folder, :ok, @path_table)
+
+    dir_folder = fn {_key, dir}, :ok ->
+      case File.rmdir(dir) do
+        :ok -> :ok
+        {:error, :eexist} -> :ok
+        {:error, :enoent} -> :ok
+        {:error, :enotdir} -> :ok
+      end
+    end
+
+    :ets.foldl(dir_folder, :ok, @dir_table)
   end
 
   ## Helpers
@@ -150,20 +179,33 @@ defmodule Briefly.Entry do
   end
 
   defp generate_tmp_dir(tmp_roots) do
-    {mega, _, _} = :os.timestamp()
-    subdir = "briefly-#{mega}"
+    subdir = path(%{prefix: "briefly-", extname: ""})
 
-    if tmp = Enum.find_value(tmp_roots, &write_tmp_dir(Path.join(&1, subdir))) do
+    if tmp = Enum.find_value(tmp_roots, &write_tmp_dir({&1, subdir})) do
       {:ok, tmp}
     else
       {:no_tmp, tmp_roots}
     end
   end
 
-  defp write_tmp_dir(path) do
-    case File.mkdir_p(path) do
-      :ok -> path
-      {:error, _} -> nil
+  defp write_tmp_dir({root, path}) do
+    fullpath = Path.join(root, path)
+
+    case File.mkdir_p(root) do
+      {:error, _} ->
+        nil
+
+      :ok ->
+        case File.mkdir(fullpath) do
+          {:error, _} ->
+            nil
+
+          :ok ->
+            case File.chmod(fullpath, Briefly.Config.directory_mode()) do
+              {:error, _} -> nil
+              :ok -> fullpath
+            end
+        end
     end
   end
 
@@ -172,7 +214,8 @@ defmodule Briefly.Entry do
 
     case File.mkdir_p(path) do
       :ok ->
-        :ets.insert(@path_table, {self(), path})
+        value = %{path: path, root_dir: tmp, original_owner: self()}
+        :ets.insert(@path_table, {self(), value})
         {:ok, path}
 
       {:error, :enospc} ->
@@ -191,7 +234,8 @@ defmodule Briefly.Entry do
 
     case File.open(path, [:read, :write, :exclusive]) do
       {:ok, device_pid} ->
-        :ets.insert(@path_table, {self(), path})
+        value = %{path: path, root_dir: tmp, original_owner: self()}
+        :ets.insert(@path_table, {self(), value})
         {:ok, path, device_pid}
 
       {:error, :enospc} ->
@@ -210,7 +254,8 @@ defmodule Briefly.Entry do
 
     case :file.write_file(path, "", [:write, :raw, :exclusive, :binary]) do
       :ok ->
-        :ets.insert(@path_table, {self(), path})
+        value = %{path: path, root_dir: tmp, original_owner: self()}
+        :ets.insert(@path_table, {self(), value})
         {:ok, path}
 
       {:error, :enospc} ->
@@ -228,20 +273,21 @@ defmodule Briefly.Entry do
     {:too_many_attempts, tmp, attempts}
   end
 
-  defp path(options, tmp) do
+  defp path(options) do
     time = :erlang.monotonic_time() |> to_string |> String.trim("-")
 
-    folder =
-      Enum.join(
-        [
-          prefix(options),
-          time,
-          random_padding()
-        ],
-        "-"
-      ) <> extname(options)
+    Enum.join(
+      [
+        prefix(options),
+        time,
+        random_padding()
+      ],
+      "-"
+    ) <> extname(options)
+  end
 
-    Path.join([tmp, folder])
+  defp path(options, tmp) do
+    Path.join([tmp, path(options)])
   end
 
   defp random_padding(length \\ 20) do
@@ -261,12 +307,15 @@ defmodule Briefly.Entry do
     :ets.member(@dir_table, pid)
   end
 
-  defp path_owner?(pid, path) do
+  defp path_entry_if_owner(pid, path) do
     owned_paths = :ets.lookup(@path_table, pid)
-    Enum.any?(owned_paths, fn {_pid, p} -> p == path end)
+
+    Enum.find_value(owned_paths, fn {_pid, %{path: p} = entry} ->
+      if p == path, do: entry
+    end)
   end
 
-  defp delete_path({_pid, path}) do
+  defp delete_path({_pid, %{path: path}}) do
     File.rm_rf(path)
     :ok
   end
